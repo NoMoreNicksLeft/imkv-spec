@@ -5,3 +5,7 @@
 __pycache__/
 *.pyc
 WORKLOG.md
+*.ttf
+*.otf
+*.woff
+*.woff2

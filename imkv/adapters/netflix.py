@@ -86,8 +86,7 @@ def state_to_lets(d, indent="    "):
 # ── Script builder ────────────────────────────────────────────────────────────
 
 def build_scripts(seg_id, seg_data, seg_moments, preconditions,
-                  segmentGroups, uid_map,
-                  timeout_override=None, font=None, asset_uid_map=None):
+                  segmentGroups, uid_map, **kwargs):
     """
     Build entry and leave MKVScript strings for a single segment.
 
@@ -105,6 +104,15 @@ def build_scripts(seg_id, seg_data, seg_moments, preconditions,
     """
     entry_lines = []
     leave_lines = []
+
+    set_font_uid    = kwargs.get('set_font_uid', None)
+    timeout_override = kwargs.get('timeout_override', None)
+    asset_uid_map    = kwargs.get('asset_uid_map', None)
+
+    # If this is the first chapter and a font UID is specified, emit SetFont()
+    # as the first entry script statement.
+    if set_font_uid is not None:
+        entry_lines.append(f"    SetFont(attach({set_font_uid})); // OSD font")
 
     # Entry script: emit Let() for persistent state changes on entry
     for m in seg_moments:
@@ -276,16 +284,25 @@ def build_chapters(segments, moments_by_seg, preconditions,
     uid_map     = {seg_id: random.randint(1, 2**32) for seg_id in segments}
     edition_uid = random.randint(1, 2**32)
 
+    # font_uid: if provided, emit SetFont(attach(N)) in the first chapter's
+    # entry script so the renderer knows which embedded font to use for OSD.
+    font_uid = kwargs.pop('font_uid', None)
+
     atoms = b""
     total = len(segments)
+    first = True
     for i, (seg_id, seg_data) in enumerate(segments.items(), 1):
         if i % 50 == 0:
             print(f"  Chapter {i}/{total}: {seg_id}", flush=True)
+        atom_kwargs = dict(kwargs)
+        if first and font_uid is not None:
+            atom_kwargs['set_font_uid'] = font_uid
+            first = False
         atoms += build_chapter_atom(
             seg_id, seg_data,
             moments_by_seg.get(seg_id, []),
             preconditions, segmentGroups,
-            uid_map, **kwargs)
+            uid_map, **atom_kwargs)
 
     edition = el(ID_EditionEntry,
                  el_uint(ID_EditionUID, edition_uid, 4)

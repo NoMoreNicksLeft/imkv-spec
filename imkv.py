@@ -170,11 +170,21 @@ def cmd_netflix(args):
 
     # Build chapters
     print(f"\nBuilding chapters...")
+
+    # Find font attachment UID if a font was embedded
+    font_uid = None
+    if font_path:
+        fname = os.path.basename(font_path)
+        font_uid = asset_uid_map.get(fname)
+        if font_uid:
+            print(f"  Font attachment UID: {font_uid} ({fname})")
+
     chapters_ebml, uid_map = build_chapters(
         segments, moments_by_seg, preconditions, segmentGroups,
         timeout_override=args.timeout,
         font=args.font,
         asset_uid_map=asset_uid_map if asset_uid_map else None,
+        font_uid=font_uid,
     )
     print(f"  Chapters element: {len(chapters_ebml):,} bytes")
 

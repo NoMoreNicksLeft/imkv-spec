@@ -485,10 +485,35 @@ def build_attachments(files):
 
 # ── MKV rewriter ──────────────────────────────────────────────────────────────
 
+def find_top_level_elements(source_path, seg_body_start):
+    """
+    Scan the segment body and return a list of (elem_id, offset, total_size)
+    for all top-level elements. Used to locate and skip elements like
+    existing Attachments when rewriting.
+    """
+    elements = []
+    with open(source_path, 'rb') as f:
+        f.seek(seg_body_start)
+        while True:
+            offset = f.tell()
+            elem_id, id_len = read_element_id(f)
+            if elem_id is None:
+                break
+            size, size_len = read_vint(f)
+            # Unknown-size segment: stop
+            if size == (1 << 56) - 1:
+                break
+            total = id_len + size_len + size
+            elements.append((elem_id, offset, total))
+            f.seek(offset + total)
+    return elements
+
 def rewrite_with_chapters(source_path, chapters_ebml, out_path,
                            attachments_ebml=None, verbose=True):
     """
     Write a new MKV file with Chapters (and optionally Attachments) inserted.
+    If attachments_ebml is provided, any existing Attachments element in the
+    source is stripped so we don't end up with two Attachments elements.
     Updates SeekHead entries and Cues cluster positions accordingly.
     """
     source_size = os.path.getsize(source_path)
@@ -503,6 +528,21 @@ def rewrite_with_chapters(source_path, chapters_ebml, out_path,
     void_total       = info['void_total']
     insertion_offset = info['insertion_offset']
     orig_entries     = info['original_entries']
+
+    # Find and record any existing Attachments/Chapters elements to skip
+    # when we are providing our own (to avoid duplicates).
+    skip_ranges = []  # list of (start_offset, end_offset) to omit from source copy
+    if attachments_ebml:
+        top_elems = find_top_level_elements(source_path, seg_body_start)
+        for elem_id, offset, total in top_elems:
+            if elem_id == ID_Attachments:
+                skip_ranges.append((offset, offset + total))
+                if verbose:
+                    print(f"  Skipping existing Attachments element at {offset} ({total:,} bytes)")
+            elif elem_id == ID_Chapters:
+                skip_ranges.append((offset, offset + total))
+                if verbose:
+                    print(f"  Skipping existing Chapters element at {offset} ({total:,} bytes)")
 
     # Combined insert: Chapters + optional Attachments
     insert_ebml = chapters_ebml
@@ -583,12 +623,37 @@ def rewrite_with_chapters(source_path, chapters_ebml, out_path,
             print(f"  Inserted {len(chapters_ebml):,}B Chapters"
                   + (f" + {len(attachments_ebml):,}B Attachments" if attachments_ebml else ""))
 
-        # Copy remainder
+        # Copy remainder, skipping any recorded ranges
+        skip_sorted = sorted(skip_ranges)
         last_pct = -1
         while True:
+            current_pos = src.tell()
+            # Check if we're at a skip range
+            skipped = False
+            for sk_start, sk_end in skip_sorted:
+                if current_pos == sk_start:
+                    src.seek(sk_end)
+                    skipped = True
+                    break
+            if skipped:
+                continue
+
             data = src.read(chunk_size)
             if not data: break
-            dst.write(data); written += len(data)
+
+            # Trim any skip range that falls within this chunk
+            chunk_start = current_pos
+            chunk_end   = current_pos + len(data)
+            trimmed = bytearray(data)
+            offset_adj = 0
+            for sk_start, sk_end in skip_sorted:
+                if sk_start >= chunk_start and sk_end <= chunk_end:
+                    # Skip range fully within this chunk
+                    rel_start = sk_start - chunk_start - offset_adj
+                    rel_end   = sk_end   - chunk_start - offset_adj
+                    del trimmed[rel_start:rel_end]
+                    offset_adj += (sk_end - sk_start)
+            dst.write(trimmed); written += len(trimmed)
             if verbose:
                 pct = int(src.tell() / source_size * 100)
                 if pct != last_pct:
@@ -603,3 +668,96 @@ def rewrite_with_chapters(source_path, chapters_ebml, out_path,
     if verbose: print(f"\nPatching Cues element...")
     insertion_rel = insertion_offset - seg_body_start
     patch_cues(out_path, seg_body_start, insertion_rel, insert_size)
+
+
+# ── Title JSON → chapter EBML —————————————————————————————————————————————
+
+def _parse_timecode(tc: str) -> int:
+    """Parse HH:MM:SS.mmm into nanoseconds."""
+    tc = tc.strip().replace(',', '.')
+    parts = tc.split(':')
+    h = int(parts[0])
+    m = int(parts[1])
+    s_parts = parts[2].split('.')
+    s = int(s_parts[0])
+    frac_str = s_parts[1] if len(s_parts) > 1 else '0'
+    frac_str = (frac_str + '000000000')[:9]
+    return (h * 3600 + m * 60 + s) * 1_000_000_000 + int(frac_str)
+
+
+def build_chapters_from_title(chapters: list, styles: dict,
+                               attach_index: dict, name_to_uid: dict) -> tuple:
+    """
+    Build a Chapters EBML element from a title JSON chapter list.
+
+    chapters    : list of chapter dicts (from title JSON)
+    styles      : dict of named style defs (from title JSON)
+    attach_index: filename -> uid (int)
+    name_to_uid : chapter name -> uid (int)
+
+    Returns (chapters_ebml, uid_map) where uid_map maps chapter name -> uid.
+    """
+    import random
+    from imkv.title import render_enter, render_leave
+
+    uid_map = {}
+    for ch in chapters:
+        uid  = ch.get('uid') or random.randint(1, 2**32)
+        name = ch.get('name', str(uid))
+        uid_map[name] = uid
+
+    # Merge provided name_to_uid (may have pre-resolved names)
+    name_to_uid = {**uid_map, **name_to_uid}
+
+    edition_uid = random.randint(1, 2**32)
+    atoms = b""
+
+    for ch in chapters:
+        uid   = ch.get('uid') or uid_map.get(ch.get('name', ''), 0)
+        name  = ch.get('name', str(uid))
+        start = _parse_timecode(ch.get('start', '00:00:00.000'))
+        end   = _parse_timecode(ch.get('end',   '00:00:00.000'))
+
+        display = el(ID_ChapterDisplay,
+                     el_str(ID_ChapterString, name)
+                     + el_str(ID_ChapterLanguage, 'eng'))
+
+        atom_data = (
+            el_uint(ID_ChapterUID, uid, 4)
+            + el_uint(ID_ChapterTimeStart, start, 8)
+            + el_uint(ID_ChapterTimeEnd, end, 8)
+            + el_uint(ID_ChapterFlagHidden, 0)
+            + el_uint(ID_ChapterFlagEnabled, 1)
+            + display
+            + el_str(ID_ChapterStringUID, name)
+        )
+
+        # Resolve goto name references in leave menu options
+        leave_raw = ch.get('leave')
+        if isinstance(leave_raw, dict) and 'menu' in leave_raw:
+            for opt in leave_raw['menu'].get('options', []):
+                goto = opt.get('goto')
+                if isinstance(goto, str) and goto in name_to_uid:
+                    opt['goto'] = name_to_uid[goto]
+
+        enter_script = render_enter(ch.get('enter'))
+        leave_script = render_leave(leave_raw, styles, attach_index)
+
+        for script, time_val in [(enter_script, 1), (leave_script, 2)]:
+            if script and script.strip():
+                cmd = el(ID_ChapProcessCommand,
+                         el_uint(ID_ChapProcessTime, time_val)
+                         + el_bin(ID_ChapProcessData, script.encode('utf-8')))
+                atom_data += el(ID_ChapProcess,
+                                el_uint(ID_ChapProcessCodecID, 0) + cmd)
+
+        atoms += el(ID_ChapterAtom, atom_data)
+
+    edition = el(ID_EditionEntry,
+                 el_uint(ID_EditionUID, edition_uid, 4)
+                 + el_uint(ID_EditionFlagHidden, 0)
+                 + el_uint(ID_EditionFlagDefault, 1)
+                 + el_uint(ID_EditionFlagOrdered, 1)
+                 + atoms)
+
+    return el(ID_Chapters, edition), uid_map

@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from imkv.core import rewrite_with_chapters, build_attachments
 from imkv.adapters.netflix import build_chapters, load_manifest
+from imkv.title import bake as title_bake
 
 
 WEBP_MIME  = "image/webp"
@@ -111,6 +112,49 @@ def build_attachment_list(asset_paths, font_path=None):
         print(f"  Attachment {uid}: {fname} ({len(data):,} bytes, {mime}) [font]")
 
     return files
+
+
+def cmd_fetch_assets(args):
+    import json
+    from imkv.title import fetch_attachment, _asset_cache_dir
+
+    with open(args.title) as f:
+        title = json.load(f)
+
+    cache_dir = _asset_cache_dir(args.title)
+    print(f"Fetching assets for: {title.get('title', args.title)}")
+    print(f"Cache directory: {cache_dir}")
+
+    ok = skipped = failed = 0
+    for att in title.get("attachments", []):
+        fname = att.get("filename", "")
+        if not att.get("_source_url"):
+            skipped += 1
+            continue
+        data, info = fetch_attachment(att, args.title)
+        if data is None:
+            print(f"  FAILED: {fname}: {info}")
+            failed += 1
+        else:
+            ok += 1
+
+    print(f"\nDone. {ok} downloaded/cached, {skipped} skipped (no URL), {failed} failed.")
+
+
+def cmd_bake(args):
+    source_path = args.source
+    title_path  = args.title
+    out_path    = args.output or source_path.rsplit('.mkv', 1)[0] + '_imkv.mkv'
+
+    if not os.path.exists(source_path):
+        print(f"Error: source file not found: {source_path}")
+        sys.exit(1)
+    if not os.path.exists(title_path):
+        print(f"Error: title JSON not found: {title_path}")
+        sys.exit(1)
+
+    print(f"Baking: {title_path} + {source_path} -> {out_path}")
+    title_bake(title_path, source_path, out_path)
 
 
 def cmd_netflix(args):
@@ -203,6 +247,19 @@ def main():
         description="Convert source MKV + interactive manifest to iMKV format.")
     subparsers = parser.add_subparsers(dest="adapter", required=True)
 
+    # fetch-assets subcommand
+    fa = subparsers.add_parser("fetch-assets",
+        help="Pre-download all remote assets referenced in a title JSON")
+    fa.add_argument("title", help="Title JSON file")
+
+    # bake subcommand
+    bk = subparsers.add_parser("bake",
+        help="Bake a title JSON + source MKV into an iMKV file")
+    bk.add_argument("title",  help="Title JSON file")
+    bk.add_argument("source", help="Source MKV file")
+    bk.add_argument("-o", "--output", default=None,
+                    help="Output path (default: source_imkv.mkv)")
+
     # netflix subcommand
     nf = subparsers.add_parser("netflix",
         help="Convert a Netflix interactive title")
@@ -225,7 +282,11 @@ def main():
 
     args = parser.parse_args()
 
-    if args.adapter == "netflix":
+    if args.adapter == "fetch-assets":
+        cmd_fetch_assets(args)
+    elif args.adapter == "bake":
+        cmd_bake(args)
+    elif args.adapter == "netflix":
         cmd_netflix(args)
 
 

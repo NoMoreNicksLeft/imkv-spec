@@ -9,3 +9,20 @@ WORKLOG.md
 *.otf
 *.woff
 *.woff2
+
+# Third-party / source assets and raw upstream manifest data — never commit.
+# These are inputs we derive our own structural JSON from, or images/fonts
+# pulled from a provider, not work we authored ourselves.
+*.png
+*.jpg
+*.jpeg
+*.iso
+netflix_json/
+*_assets/
+
+# Ad-hoc debugging/probe scripts and scratch output from interactive
+# debugging sessions — not part of the maintained toolchain.
+analyze_iym*.py
+check_*.py
+test.ass
+test2.ass
